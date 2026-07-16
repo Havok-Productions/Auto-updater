@@ -122,6 +122,7 @@ public final class AutoUpdater {
         config.configPath = configPath;
         config.baseDir = configPath.getParent() == null ? Paths.get(".").toAbsolutePath().normalize() : configPath.getParent();
         config.validate();
+        ConfigRewriter.refreshConfigSchema(config);
         CacheMaintenance.run(config);
 
         Updater updater = new Updater(config);
@@ -1939,6 +1940,18 @@ public final class AutoUpdater {
     }
 
     private static final class ConfigRewriter {
+        static void refreshConfigSchema(AppConfig config) throws IOException {
+            if (config.configPath == null || !Files.exists(config.configPath)) {
+                return;
+            }
+            List<String> lines = Files.readAllLines(config.configPath, StandardCharsets.UTF_8);
+            boolean changed = normalizeEditableConfigSettings(lines, config);
+            if (!changed) {
+                return;
+            }
+            writeConfigLines(config.configPath, lines);
+            Log.info("Updated config schema defaults in " + config.configPath.getFileName() + ".");
+        }
         static void saveDiscoveredPluginSources(AppConfig config, List<TargetConfig> targets) throws IOException {
             if (config.configPath == null) {
                 Log.warn("Config path is unknown; discovered sources were not saved.");
@@ -1991,15 +2004,7 @@ public final class AutoUpdater {
                 return;
             }
 
-            String newline = detectNewline(config.configPath);
-            String text = String.join(newline, lines) + newline;
-            Path temp = config.configPath.resolveSibling(config.configPath.getFileName() + ".tmp");
-            Files.writeString(temp, text, StandardCharsets.UTF_8);
-            try {
-                Files.move(temp, config.configPath, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
-            } catch (AtomicMoveNotSupportedException ex) {
-                Files.move(temp, config.configPath, StandardCopyOption.REPLACE_EXISTING);
-            }
+            writeConfigLines(config.configPath, lines);
             if (consumedNewPluginLinks > 0) {
                 Log.info("Imported " + consumedNewPluginLinks + " newPluginLinks item"
                     + (consumedNewPluginLinks == 1 ? "" : "s") + " into the manual plugin catalog in "
@@ -2117,14 +2122,89 @@ public final class AutoUpdater {
                 .trim();
             return lower(link);
         }
+        private static void writeConfigLines(Path configPath, List<String> lines) throws IOException {
+            String newline = detectNewline(configPath);
+            String text = String.join(newline, lines) + newline;
+            Path temp = configPath.resolveSibling(configPath.getFileName() + ".tmp");
+            Files.writeString(temp, text, StandardCharsets.UTF_8);
+            try {
+                Files.move(temp, configPath, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+            } catch (AtomicMoveNotSupportedException ex) {
+                Files.move(temp, configPath, StandardCopyOption.REPLACE_EXISTING);
+            }
+        }
         private static boolean normalizeEditableConfigSettings(List<String> lines, AppConfig config) {
             boolean changed = false;
             changed |= ensureTopLevelGithubToken(lines, config);
+            changed |= ensureNewPluginLinksInbox(lines);
             changed |= normalizeDiscoverySourcePriority(lines, config);
+            changed |= ensureDiscoverySchemaDefaults(lines);
             changed |= refreshDiscoveryComments(lines);
             return changed;
         }
 
+        private static boolean ensureNewPluginLinksInbox(List<String> lines) {
+            if (findTopLevelSectionByNormalized(lines, Set.of("newpluginlinks", "pluginlinkinbox")) >= 0) {
+                return false;
+            }
+            int insertAt = findTopLevelSection(lines, "discovery");
+            if (insertAt < 0) {
+                insertAt = findTopLevelSection(lines, "plugins");
+            }
+            if (insertAt < 0) {
+                insertAt = lines.size();
+            }
+            if (insertAt > 0 && !lines.get(insertAt - 1).isBlank()) {
+                lines.add(insertAt, "");
+                insertAt++;
+            }
+            lines.add(insertAt, "newPluginLinks: []");
+            insertAt++;
+            if (insertAt < lines.size() && !lines.get(insertAt).isBlank()) {
+                lines.add(insertAt, "");
+            }
+            return true;
+        }
+
+        private static boolean ensureDiscoverySchemaDefaults(List<String> lines) {
+            boolean changed = false;
+            changed |= ensureDiscoveryKey(lines, "checkAlternateSourcesWhenOutdated", "true");
+            changed |= ensureDiscoveryKey(lines, "outdatedThresholdDays", "14");
+            changed |= ensureDiscoveryKey(lines, "autoSwitchSource", "true");
+            changed |= ensureDiscoveryKey(lines, "saveDiscoveredSources", "true");
+            changed |= ensureDiscoveryKey(lines, "scanInstalledPlugins", "true");
+            changed |= ensureDiscoveryKey(lines, "pruneMissingInstalledPlugins", "true");
+            changed |= ensureDiscoveryKey(lines, "retryDeferredAfterStartup", "true");
+            changed |= ensureDiscoveryKey(lines, "pathfindingDebug", "false");
+            changed |= ensureDiscoveryKey(lines, "pathfindingDebugPlugin", quoteYaml(""));
+            changed |= ensureDiscoveryKey(lines, "pathfindingDebugFile", "architecture-pathfinding.debug");
+            return changed;
+        }
+
+        private static boolean ensureDiscoveryKey(List<String> lines, String key, String value) {
+            int discoveryStart = findTopLevelSection(lines, "discovery");
+            if (discoveryStart < 0) {
+                return false;
+            }
+            int discoveryEnd = findNextTopLevel(lines, discoveryStart + 1);
+            String normalized = normalizedKey(key);
+            for (int i = discoveryStart + 1; i < discoveryEnd; i++) {
+                String noComment = ConfigParser.stripComment(lines.get(i));
+                if (noComment.trim().isEmpty() || ConfigParser.countIndent(noComment) <= 0) {
+                    continue;
+                }
+                try {
+                    KeyValue kv = ConfigParser.keyValue(noComment.trim(), ConfigParser.countIndent(noComment));
+                    if (normalizedKey(kv.key).equals(normalized)) {
+                        return false;
+                    }
+                } catch (IllegalArgumentException ignored) {
+                    // Keep scanning discovery entries.
+                }
+            }
+            lines.add(discoveryEnd, "  " + key + ": " + value);
+            return true;
+        }
         private static boolean ensureTopLevelGithubToken(List<String> lines, AppConfig config) {
             if (topLevelKeyIndex(lines, "githubToken") >= 0 || topLevelKeyIndex(lines, "github_token") >= 0) {
                 return normalizeExistingGithubToken(lines, config);
