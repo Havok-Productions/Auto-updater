@@ -9603,6 +9603,19 @@ public final class AutoUpdater {
             try {
                 Path lock = config.resolve(Paths.get("updater.lock.yml"));
                 LockState state = LockState.read(config);
+                ServerLockSnapshot previous = new ServerLockSnapshot(state.serverProject, state.serverGameVersion, state.serverBuild);
+                boolean serverChanged = serverLockChanged(previous, download);
+                int clearedPluginFailures = 0;
+                int clearedSourceFailures = 0;
+                int clearedDiscoveryStates = 0;
+                if (serverChanged) {
+                    clearedPluginFailures = state.badPluginVersions.size();
+                    clearedSourceFailures = state.badSourceBuilds.size();
+                    clearedDiscoveryStates = state.discoveryStates.size();
+                    state.badPluginVersions.clear();
+                    state.badSourceBuilds.clear();
+                    state.discoveryStates.clear();
+                }
                 state.serverProject = download.project;
                 state.serverGameVersion = download.gameVersion;
                 state.serverBuild = download.build;
@@ -9611,10 +9624,44 @@ public final class AutoUpdater {
                 pathDebug(target, "lock.server.update", "project=" + download.project
                     + "; gameVersion=" + download.gameVersion
                     + "; build=" + firstNonBlank(download.build, "unknown"));
+                if (serverChanged) {
+                    int cleared = clearedPluginFailures + clearedSourceFailures + clearedDiscoveryStates;
+                    Log.info("Server jar changed from " + describeServerLock(previous) + " to "
+                        + describeServerLock(new ServerLockSnapshot(download.project, download.gameVersion, download.build))
+                        + "; cleared " + cleared + " plugin retry memory entr" + (cleared == 1 ? "y" : "ies")
+                        + " so failed plugins and unresolved sources can be checked again.");
+                    pathDebug(target, "lock.server.retry-memory-cleared",
+                        "previous=" + describeServerLock(previous)
+                            + "; current=" + describeServerLock(new ServerLockSnapshot(download.project, download.gameVersion, download.build))
+                            + "; badPluginVersions=" + clearedPluginFailures
+                            + "; badSourceBuilds=" + clearedSourceFailures
+                            + "; discoveryStates=" + clearedDiscoveryStates);
+                }
             } catch (IOException ex) {
                 pathDebug(target, "lock.server.update.failed", ex.getMessage());
                 Log.warn("Could not write updater.lock.yml: " + ex.getMessage());
             }
+        }
+
+        private boolean serverLockChanged(ServerLockSnapshot previous, ResolvedDownload download) {
+            if (previous == null || download == null) {
+                return false;
+            }
+            if (previous.project.isBlank() && previous.gameVersion.isBlank() && previous.build.isBlank()) {
+                return false;
+            }
+            return !previous.project.equalsIgnoreCase(firstNonBlank(download.project, ""))
+                || !previous.gameVersion.equalsIgnoreCase(firstNonBlank(download.gameVersion, ""))
+                || !previous.build.equalsIgnoreCase(firstNonBlank(download.build, ""));
+        }
+
+        private String describeServerLock(ServerLockSnapshot lock) {
+            if (lock == null || (lock.project.isBlank() && lock.gameVersion.isBlank() && lock.build.isBlank())) {
+                return "unlocked server";
+            }
+            return firstNonBlank(lock.project, "server") + " "
+                + firstNonBlank(lock.gameVersion, "unknown-version")
+                + (lock.build.isBlank() ? "" : " build " + lock.build);
         }
 
         private SourcePlan resolveSource(TargetConfig target) {
