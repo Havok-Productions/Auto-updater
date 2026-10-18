@@ -125,6 +125,15 @@ final class ExampleConfig {
               #   installAs: plugins/FancyHolograms.jar
               #   required: false
 
+            # Linux: sandbox tooling is prepared automatically in the updater cache.
+            upgradeTest:
+              enabled: true
+              startupSeconds: 180
+              observeSeconds: 15
+              stopSeconds: 30
+              javaArgs: "-Xms256M -Xmx2G"
+              excludePlugins: []
+
             restart:
               enabled: true
               interval: 7d

@@ -140,6 +140,51 @@ restart:
 ```
 
 
+## Pre-upgrade Startup Test
+
+`upgradeTest.enabled: true` prepares changes before replacing live jars. When the
+server jar changes, it launches the proposed server and plugins in a temporary
+flat world, with separate ports and copies of plugin/Paper/Folia configuration.
+Pinned plugins (`autoUpdate: false`) are included using their installed jars.
+Previously failed plugin candidates are reconsidered for the proposed server;
+an identified failing candidate may be retried with its installed jar once.
+
+Only successful startup, the expected plugin enable messages, a short observation
+window, and clean shutdown approve installation. Scheduled preparation happens
+while the live server stays online. Failed combinations are remembered by hashes
+of the proposed jars and copied configuration; changed inputs are tested again.
+Preparation or sandbox failures postpone the upgrade without changing live jars.
+An installation failure restores any jars already replaced before restarting.
+
+On Debian/Ubuntu, the updater uses an existing `bubblewrap` installation or
+automatically obtains a private copy through the host's signed APT repositories.
+APT verifies signatures and package hashes; bubblewrap and its libcap runtime are
+extracted under `cache/tools/bubblewrap`, without sudo or system package changes.
+The private copy is reused on subsequent runs. Setup diagnostics are in that
+directory's `setup.log`. The host must permit unprivileged user namespaces.
+The test has no external network and can write only its temporary directory.
+PaperMC's trusted patch-only bootstrap may download runtime artifacts
+before the network-isolated test, without enabling plugins. Unsupported hosts or
+blocked namespaces or failed automatic setup postpone upgrades; no unisolated
+fallback is attempted.
+
+Only configuration files (YAML, JSON, TOML, CONF, properties, XML) are copied, at
+most 2 MiB per file and 64 MiB per directory tree. World data, database files, symlinks,
+logs, backups and caches are excluded. Runtime JARs may be reused for bootstrap.
+Some data-dependent or network-dependent plugins cannot enable under these
+conditions and will block the test. Explicit `upgradeTest.excludePlugins` names
+can exclude their jars, with exclusions reported, but their dependants may fail.
+No plugin is silently treated as tested. Configuration changes during a running
+test are not covered; large data-specific and gameplay failures remain outside
+this startup check. Configure `startupSeconds`, `observeSeconds`, `stopSeconds`
+and the separate test `javaArgs` as needed; the test adds memory/CPU load.
+
+Reports are retained under `cache/upgrade-tests/test-*/` (`result.txt`,
+`console.log`, `bootstrap.log`); disposable worlds and configuration copies are
+removed after each test. Reports may contain plugin output; keep them private.
+This is a preflight check, not a world backup or a guarantee of safe world-format
+rollback. The existing live startup rollback behavior still applies.
+
 ## Building instructions
 
 ./gradlew build

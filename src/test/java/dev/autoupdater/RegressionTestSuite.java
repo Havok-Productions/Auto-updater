@@ -5,6 +5,8 @@ public final class RegressionTestSuite {
     }
 
     public static void main(String[] args) throws Exception {
+        UpgradeSmokeTestRegressionTest.main(args);
+        UpgradePreparationRegressionTest.main(args);
         DiscoveryProofFlowRegressionTest.main(args);
         ServerRollbackLockRegressionTest.main(args);
         HostedFallbackGitFreshnessRegressionTest.main(args);

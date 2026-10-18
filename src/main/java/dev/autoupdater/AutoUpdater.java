@@ -243,6 +243,8 @@ public final class AutoUpdater {
         ValidationConfig validation = new ValidationConfig();
         DuplicateConfig duplicates = new DuplicateConfig();
         RestartConfig restart = new RestartConfig();
+        UpgradeSmokeTest.Settings upgradeTest = new UpgradeSmokeTest.Settings();
+        boolean preparingServerChange;
         SelfUpdateConfig selfUpdate = new SelfUpdateConfig();
         List<SourceHint> sourceHints = defaultSourceHints();
         GithubRateLimitState githubRateLimit = new GithubRateLimitState();
@@ -289,6 +291,9 @@ public final class AutoUpdater {
                 throw new IllegalArgumentException("restart.startupRollbackPolicy must be rollbackBatch or rollbackMatchedOnly");
             }
             restart.startupRollbackPolicy = rollbackPolicy.equals("rollbackmatchedonly") ? "rollbackMatchedOnly" : "rollbackBatch";
+            if (upgradeTest.startupSeconds < 1 || upgradeTest.observeSeconds < 0 || upgradeTest.stopSeconds < 1) {
+                throw new IllegalArgumentException("upgradeTest timeouts must be positive (observeSeconds may be zero)");
+            }
         }
 
         private void applyCacheDefaults() {
@@ -1315,6 +1320,9 @@ public final class AutoUpdater {
                 }
 
                 switch (section) {
+                    case "upgradetest":
+                        applyUpgradeTest(config.upgradeTest, keyValue(line, lineNo));
+                        break;
                     case "server":
                         applyTarget(config.server, keyValue(line, lineNo));
                         break;
@@ -1783,6 +1791,18 @@ public final class AutoUpdater {
             }
         }
 
+        private static void applyUpgradeTest(UpgradeSmokeTest.Settings test, KeyValue kv) {
+            switch (lower(kv.key)) {
+                case "enabled": test.enabled = parseBooleanStrict(kv.key, kv.value); break;
+                case "startupseconds": test.startupSeconds = Integer.parseInt(kv.value); break;
+                case "observeseconds": test.observeSeconds = Integer.parseInt(kv.value); break;
+                case "stopseconds": test.stopSeconds = Integer.parseInt(kv.value); break;
+                case "javaargs": test.javaArgs = kv.value; break;
+                case "excludeplugins": test.excludePlugins = parseList(kv.value); break;
+                default: throw new IllegalArgumentException("Unknown upgradeTest key: " + kv.key);
+            }
+        }
+
         private static void applyRestart(RestartConfig restart, KeyValue kv) {
             switch (lower(kv.key)) {
                 case "enabled":
@@ -2139,6 +2159,15 @@ public final class AutoUpdater {
             changed |= ensureNewPluginLinksInbox(lines);
             changed |= normalizeDiscoverySourcePriority(lines, config);
             changed |= ensureDiscoverySchemaDefaults(lines);
+            if (findTopLevelSectionByNormalized(lines, Set.of("upgradetest")) < 0) {
+                int at = findTopLevelSection(lines, "plugins");
+                if (at < 0) { at = lines.size(); }
+                lines.addAll(at, List.of("# Test proposed server jars in an isolated new world before installation.",
+                    "upgradeTest:", "  enabled: true", "  startupSeconds: 180", "  observeSeconds: 15",
+                    "  stopSeconds: 30", "  javaArgs: \"-Xms256M -Xmx2G\"",
+                    "  excludePlugins: []", ""));
+                changed = true;
+            }
             changed |= refreshDiscoveryComments(lines);
             return changed;
         }
@@ -3982,6 +4011,26 @@ public final class AutoUpdater {
         }
     }
 
+    private static final class PreparedUpdate {
+        final TargetConfig target;
+        final Path jar;
+        final ResolvedDownload download;
+        final String hash;
+
+        PreparedUpdate(TargetConfig target, Path jar, ResolvedDownload download, String hash) {
+            this.target = target;
+            this.jar = jar;
+            this.download = download;
+            this.hash = hash;
+        }
+    }
+
+    private static final class PreparedBatch {
+        final List<PreparedUpdate> updates = new ArrayList<>();
+        boolean approved = true;
+        ResolvedDownload serverResolution;
+    }
+
     private static final class ServerLockSnapshot {
         final String project;
         final String gameVersion;
@@ -4190,6 +4239,7 @@ public final class AutoUpdater {
         private final AppConfig config;
         private final HttpClient client;
         private final LockState lockState;
+        private PreparedBatch preparing;
         private final Set<String> writtenDiagnostics = new HashSet<>();
         private final Set<String> githubBudgetWarnings = new HashSet<>();
         private final Set<String> githubBudgetLimitedPlugins = new HashSet<>();
@@ -4897,6 +4947,9 @@ public final class AutoUpdater {
         }
 
         private boolean shouldDeferMissingSourceDiscovery(TargetConfig target) {
+            if (config.preparingServerChange) {
+                return false;
+            }
             if (!needsDiscoveredSource(target)) {
                 return false;
             }
@@ -8590,54 +8643,71 @@ public final class AutoUpdater {
         }
 
         List<InstalledUpdate> updateAll() throws Exception {
+            return installPrepared(prepareUpdates());
+        }
+
+        PreparedBatch prepareUpdates() throws Exception {
             traceConfigPathOnce("updateAll");
-            List<InstalledUpdate> installed = new ArrayList<>();
-            Files.createDirectories(config.resolve(config.cacheDir));
-            Files.createDirectories(config.resolve(config.backupDir));
-            autoSwitchMissingPluginSources();
-            for (TargetConfig target : allTargets()) {
-                pathDebug(target, "update.target", "begin update pass; enabled=" + target.enabled
-                    + "; autoUpdate=" + target.autoUpdate + "; source=" + firstNonBlank(target.source, "blank")
-                    + "; origin=" + firstNonBlank(target.sourceOrigin, "blank")
-                    + "; type=" + firstNonBlank(target.type, "blank"));
-                if (!target.enabled) {
-                    pathDebug(target, "update.skip", "target disabled");
-                    Log.info("Skipping disabled target: " + target.displayName());
-                    continue;
-                }
-                if (!target.server && !target.autoUpdate) {
-                    pathDebug(target, "update.skip", "plugin autoUpdate is false");
-                    Log.info("Skipping " + target.displayName() + " because autoUpdate is false.");
-                    continue;
-                }
-                if (isMissingSourceValue(target.source)
-                    && !canBuildFromSource(target)) {
-                    pathDebug(target, "update.skip", "no source configured and no trusted source build target is available");
-                    Log.info("No source configured for " + target.displayName()
-                        + (isNotFoundSourceValue(target.source) ? " (discovery marked Not Found)" : "")
-                        + "; keeping existing jar.");
-                    continue;
-                }
-                try {
-                    Optional<InstalledUpdate> update = updateOne(target);
-                    update.ifPresent(installed::add);
-                } catch (Exception ex) {
-                    Path targetPath = config.resolve(Paths.get(target.installAs));
-                    boolean mayContinue = config.onFailure.equals("keep-current") && Files.exists(targetPath);
-                    if (!target.required && config.onFailure.equals("keep-current")) {
-                        mayContinue = true;
+            PreparedBatch batch = new PreparedBatch();
+            preparing = batch;
+            String liveGameVersion = config.server.gameVersion;
+            try {
+                Files.createDirectories(config.resolve(config.cacheDir));
+                Files.createDirectories(config.resolve(config.backupDir));
+                // Resolve the proposed server before discovery; old plugin failures may be version-specific.
+                prepareTarget(config.server);
+                config.preparingServerChange = batch.updates.stream().anyMatch(update -> update.target.server);
+                if (config.preparingServerChange) {
+                    if (batch.serverResolution != null && !firstNonBlank(batch.serverResolution.gameVersion, "").isBlank()) {
+                        config.server.gameVersion = batch.serverResolution.gameVersion;
                     }
-                    if (mayContinue) {
-                        pathDebug(target, "update.failure.keep-current", safeExceptionMessage(ex));
-                        Log.warn("Update failed for " + target.displayName() + ": " + safeExceptionMessage(ex));
-                        Log.warn("Keeping current jar for " + target.displayName() + ".");
-                    } else {
-                        pathDebug(target, "update.failure.throw", safeExceptionMessage(ex));
-                        throw ex;
-                    }
+                    pathDebug(config.server, "upgrade-test.retry-context", "reconsider plugin failures for proposed server; live memory retained");
                 }
+                autoSwitchMissingPluginSources();
+                for (TargetConfig target : config.plugins) {
+                    pathDebug(target, "update.target", "prepare; enabled=" + target.enabled
+                        + "; autoUpdate=" + target.autoUpdate + "; source=" + firstNonBlank(target.source, "blank"));
+                    prepareTarget(target);
+                }
+                if (config.preparingServerChange && config.upgradeTest.enabled) {
+                    batch.approved = testPrepared(batch);
+                }
+                if (!batch.approved) {
+                    for (PreparedUpdate update : batch.updates) { Files.deleteIfExists(update.jar); }
+                }
+                return batch;
+            } catch (Exception ex) {
+                for (PreparedUpdate update : batch.updates) {
+                    try { Files.deleteIfExists(update.jar); } catch (IOException cleanup) { ex.addSuppressed(cleanup); }
+                }
+                throw ex;
+            } finally {
+                preparing = null;
+                config.preparingServerChange = false;
+                config.server.gameVersion = liveGameVersion;
             }
-            return installed;
+        }
+
+        private void prepareTarget(TargetConfig target) throws Exception {
+            if (!target.enabled || (!target.server && !target.autoUpdate)
+                || (isMissingSourceValue(target.source) && !canBuildFromSource(target))) {
+                pathDebug(target, "update.skip", "disabled, pinned, or no usable source; installed jar retained");
+                Log.info("Keeping installed jar for " + target.displayName() + " (disabled, pinned, or no usable source).");
+                return;
+            }
+            try {
+                updateOne(target);
+            } catch (Exception ex) {
+                Path targetPath = config.resolve(Paths.get(target.installAs));
+                boolean mayContinue = config.onFailure.equals("keep-current") && (Files.exists(targetPath) || !target.required);
+                if (!mayContinue) {
+                    pathDebug(target, "update.failure.throw", safeExceptionMessage(ex));
+                    throw ex;
+                }
+                pathDebug(target, "update.failure.keep-current", safeExceptionMessage(ex));
+                Log.warn("Update failed for " + target.displayName() + ": " + safeExceptionMessage(ex));
+                Log.warn("Keeping current jar for " + target.displayName() + ".");
+            }
         }
 
         private List<TargetConfig> allTargets() {
@@ -9083,7 +9153,7 @@ public final class AutoUpdater {
             Path targetPath = config.resolve(Paths.get(target.installAs));
             Path stagingDir = config.resolve(config.cacheDir).resolve("staging");
             Files.createDirectories(stagingDir);
-            Path staging = stagingDir.resolve(safeName(target.displayName()) + "-" + System.currentTimeMillis() + ".jar");
+            Path staging = Files.createTempFile(stagingDir, safeName(target.displayName()) + "-", ".jar");
 
             download(download.uri, staging);
             pathDebug(target, "install.downloaded", "staged at " + staging);
@@ -9112,10 +9182,23 @@ public final class AutoUpdater {
                     Files.deleteIfExists(staging);
                     Log.info(target.displayName() + " is already current (" + shortHash(newHash) + ").");
                     pathDebug(target, "install.current", "candidate hash matches installed jar " + shortHash(newHash));
-                    quarantineDuplicatePluginJars(target, targetPath);
-                    updateLockIfNeeded(target, download);
+                    if (preparing == null) {
+                        quarantineDuplicatePluginJars(target, targetPath);
+                        updateLockIfNeeded(target, download);
+                    } else if (target.server) {
+                        preparing.serverResolution = download;
+                    }
                     return Optional.empty();
                 }
+            }
+
+            if (preparing != null) {
+                preparing.updates.add(new PreparedUpdate(target, staging, download, newHash));
+                if (target.server) {
+                    preparing.serverResolution = download;
+                }
+                pathDebug(target, "upgrade-test.prepared", "candidate staged; live jar untouched; sha256=" + newHash);
+                return Optional.empty();
             }
 
             ServerLockSnapshot previousServerLock = target.server ? currentServerLockSnapshot() : null;
@@ -9147,8 +9230,195 @@ public final class AutoUpdater {
         }
 
         private Optional<BadPluginVersion> knownBadPlugin(TargetConfig target, ResolvedDownload download, String sha256) {
+            if (!target.server && config.preparingServerChange) {
+                return Optional.empty();
+            }
             LockState lock = LockState.read(config);
             return lock.activeBadPlugin(config, target, download, sha256);
+        }
+
+        private boolean testPrepared(PreparedBatch batch) throws Exception {
+            PreparedUpdate server = batch.updates.stream().filter(update -> update.target.server).findFirst().orElseThrow();
+            for (int attempt = 0; attempt < 2; attempt++) {
+                Path workspace = UpgradeSmokeTest.createWorkspace(config.resolve(config.cacheDir));
+                try {
+                    Path sandboxTool = ManagedSandboxTool.resolve(config.resolve(config.cacheDir));
+                    List<UpgradeSmokeTest.Plugin> plugins = testPlugins(batch);
+                    UpgradeSmokeTest.prepare(config.baseDir, workspace, server.jar, plugins);
+                    Set<String> expected = plugins.stream().map(UpgradeSmokeTest.Plugin::name)
+                        .collect(Collectors.toCollection(java.util.LinkedHashSet::new));
+                    List<String> javaCommand = new ArrayList<>();
+                    javaCommand.add(firstNonBlank(config.server.java, "java"));
+                    javaCommand.addAll(splitCommand(config.upgradeTest.javaArgs));
+                    javaCommand.addAll(List.of("-jar", "server.jar", "nogui"));
+                    List<String> command = UpgradeSmokeTest.sandboxCommand(workspace, javaCommand, sandboxTool);
+                    String fingerprint = testFingerprint(workspace, expected);
+                    Path failures = Files.createDirectories(config.resolve(config.cacheDir).resolve("upgrade-test-failures"));
+                    Path remembered = failures.resolve(fingerprint + ".txt");
+                    if (Files.exists(remembered) && Files.size(remembered) > 0) {
+                        List<String> memory = Files.readAllLines(remembered);
+                        Log.warn("This server/plugin/configuration combination already failed its test. Report: " + memory.get(0));
+                        pathDebug(config.server, "upgrade-test.remembered", "fingerprint=" + fingerprint);
+                        if (attempt == 0 && revertFailedCandidates(batch, Set.copyOf(memory.subList(1, memory.size())))) {
+                            continue;
+                        }
+                        return false;
+                    }
+                    if ("papermc".equals(server.download.sourceType)) {
+                        UpgradeSmokeTest.bootstrapPaperclip(workspace, config.server.java, config.upgradeTest, sandboxTool);
+                    }
+                    Log.info("Testing proposed server and " + expected.size() + " plugins in " + workspace + ".");
+                    if (!config.upgradeTest.excludePlugins.isEmpty()) {
+                        Log.warn("Plugins excluded from test: " + String.join(", ", config.upgradeTest.excludePlugins));
+                    }
+                    pathDebug(config.server, "upgrade-test.start", "workspace=" + workspace + "; plugins=" + expected.size());
+                    UpgradeSmokeTest.Result result = UpgradeSmokeTest.run(workspace, config.upgradeTest, expected, command);
+                    Files.writeString(workspace.resolve("result.txt"), (result.passed() ? "PASS" : "FAIL") + ": " + result.reason() + "\n");
+                    pathDebug(config.server, "upgrade-test.result", "passed=" + result.passed() + "; reason=" + result.reason());
+                    if (result.passed()) {
+                        Log.info("Upgrade startup test passed; proposed jars are approved for installation.");
+                        return true;
+                    }
+                    // Infrastructure failures must retry after the sandbox/bootstrap is repaired.
+                    if (Files.exists(workspace.resolve("console.log"))) {
+                        String output = Files.readString(workspace.resolve("console.log"));
+                        if ((output.contains("Starting org.bukkit") || output.contains("[bootstrap]"))
+                            && (!result.failedPlugins().isEmpty() || result.reason().startsWith("Plugin/server startup failure"))) {
+                            List<String> memory = new ArrayList<>();
+                            memory.add(workspace.toString());
+                            memory.addAll(result.failedPlugins());
+                            Files.write(remembered, memory);
+                        }
+                    }
+                    Log.warn("Upgrade postponed: " + result.reason() + ". Test log: " + workspace.resolve("console.log"));
+                    if (attempt == 0) {
+                        boolean reverted = revertFailedCandidates(batch, result.failedPlugins());
+                        if (reverted) {
+                            Log.info("Retrying test with installed jars for the failed plugin candidates.");
+                            continue;
+                        }
+                    }
+                    return false;
+                } catch (IOException ex) {
+                    Files.writeString(workspace.resolve("result.txt"), "BLOCKED: " + safeExceptionMessage(ex) + "\n");
+                    Log.warn("Upgrade postponed: " + safeExceptionMessage(ex) + ". Report: " + workspace.resolve("result.txt"));
+                    pathDebug(config.server, "upgrade-test.blocked", safeExceptionMessage(ex));
+                    return false;
+                } finally {
+                    UpgradeSmokeTest.removeTestPayload(workspace);
+                }
+            }
+            return false;
+        }
+
+        private boolean revertFailedCandidates(PreparedBatch batch, Set<String> failures) throws IOException {
+            boolean changed = false;
+            for (Iterator<PreparedUpdate> iterator = batch.updates.iterator(); iterator.hasNext();) {
+                PreparedUpdate update = iterator.next();
+                if (!update.target.server && Files.isRegularFile(config.resolve(Paths.get(update.target.installAs)))
+                    && failures.stream().anyMatch(name -> name.equalsIgnoreCase(update.target.displayName())
+                        || name.equalsIgnoreCase(firstNonBlank(update.target.detectedPluginId, "")))) {
+                    Files.deleteIfExists(update.jar);
+                    iterator.remove();
+                    changed = true;
+                }
+            }
+            return changed;
+        }
+
+        private List<UpgradeSmokeTest.Plugin> testPlugins(PreparedBatch batch) throws IOException {
+            Map<Path, Path> jars = new LinkedHashMap<>();
+            Path livePlugins = config.baseDir.resolve("plugins");
+            if (Files.isDirectory(livePlugins)) {
+                try (var files = Files.list(livePlugins)) {
+                    for (Path file : files.sorted().toList()) {
+                        if (Files.isRegularFile(file, java.nio.file.LinkOption.NOFOLLOW_LINKS)
+                            && lower(file.getFileName().toString()).endsWith(".jar")) {
+                            jars.put(file.toAbsolutePath().normalize(), file);
+                        }
+                    }
+                }
+            }
+            for (PreparedUpdate update : batch.updates) {
+                if (!update.target.server) {
+                    jars.put(config.resolve(Paths.get(update.target.installAs)).toAbsolutePath().normalize(), update.jar);
+                }
+            }
+            List<UpgradeSmokeTest.Plugin> result = new ArrayList<>();
+            for (Path jar : jars.values()) {
+                PluginJarInfo info = readPluginJarInfo(jar);
+                if (!info.hasDescriptor) {
+                    throw new IOException("Cannot identify plugin for upgrade test: " + jar.getFileName());
+                }
+                String name = firstNonBlank(info.name, info.id);
+                if (!UpgradeSmokeTest.excluded(config.upgradeTest, name)) {
+                    result.add(new UpgradeSmokeTest.Plugin(jar, name));
+                }
+            }
+            return result;
+        }
+
+        private String testFingerprint(Path workspace, Set<String> expected) throws Exception {
+            StringBuilder input = new StringBuilder("upgrade-test-v1\n");
+            input.append(config.server.java).append('\n').append(config.upgradeTest.javaArgs).append('\n');
+            input.append(System.getProperty("java.version")).append(':').append(System.getProperty("os.name")).append('\n');
+            input.append(config.upgradeTest.startupSeconds).append(':').append(config.upgradeTest.observeSeconds)
+                .append(':').append(config.upgradeTest.stopSeconds).append('\n');
+            input.append(String.join(",", expected)).append('\n');
+            try (var files = Files.walk(workspace)) {
+                for (Path file : files.filter(Files::isRegularFile).sorted().toList()) {
+                    Path relative = workspace.relativize(file);
+                    if (Set.of("libraries", "versions", "cache").contains(relative.getName(0).toString())) { continue; }
+                    input.append(workspace.relativize(file)).append(':').append(sha256(file)).append('\n');
+                }
+            }
+            return sha256Text(input.toString());
+        }
+
+        List<InstalledUpdate> installPrepared(PreparedBatch batch) throws Exception {
+            if (!batch.approved) {
+                Log.warn("Keeping current live jars because the upgrade test did not pass.");
+                for (PreparedUpdate update : batch.updates) { Files.deleteIfExists(update.jar); }
+                return Collections.emptyList();
+            }
+            List<InstalledUpdate> installed = new ArrayList<>();
+            try {
+                for (PreparedUpdate update : batch.updates) {
+                    if (!sha256(update.jar).equals(update.hash)) {
+                        throw new IOException("Prepared jar changed after validation: " + update.target.displayName());
+                    }
+                }
+                for (PreparedUpdate update : batch.updates) {
+                    Path target = config.resolve(Paths.get(update.target.installAs));
+                    ServerLockSnapshot previous = update.target.server ? currentServerLockSnapshot() : null;
+                    Path backupPath = Files.exists(target) ? backup(target) : null;
+                    Files.createDirectories(target.toAbsolutePath().getParent());
+                    // Copy via an adjacent file to keep replacement atomic across cache/live filesystems.
+                    Path adjacent = Files.createTempFile(target.toAbsolutePath().getParent(), "updater-", ".tmp");
+                    try {
+                        Files.copy(update.jar, adjacent, StandardCopyOption.REPLACE_EXISTING);
+                        moveReplace(adjacent, target);
+                    } finally {
+                        Files.deleteIfExists(adjacent);
+                    }
+                    ResolvedDownload d = update.download;
+                    installed.add(new InstalledUpdate(update.target, target, backupPath, update.target.source,
+                        downloadVersion(d), update.hash, d.project, d.gameVersion, d.build, previous));
+                    Log.info("Installed approved update for " + update.target.displayName() + " (" + shortHash(update.hash) + ").");
+                }
+                if (batch.serverResolution != null) {
+                    updateLockIfNeeded(config.server, batch.serverResolution, true);
+                }
+                return installed;
+            } catch (Exception ex) {
+                // Commit failures happen while the server is stopped; undo partial jar replacement.
+                new ServerRunner(config, this).rollbackUpdates(installed);
+                throw ex;
+            } finally {
+                for (PreparedUpdate update : batch.updates) {
+                    Files.deleteIfExists(update.jar);
+                }
+            }
         }
 
         private void validateDownloadedJar(TargetConfig target, SourcePlan plan, ResolvedDownload download, Path staging, Path targetPath) throws IOException {
@@ -9563,6 +9833,9 @@ public final class AutoUpdater {
                 state.serverGameVersion = update.previousServerLock.gameVersion;
                 state.serverBuild = update.previousServerLock.build;
                 state.write(config);
+                lockState.serverProject = state.serverProject;
+                lockState.serverGameVersion = state.serverGameVersion;
+                lockState.serverBuild = state.serverBuild;
                 Log.warn("Restored server version lock after rollback -> "
                     + firstNonBlank(state.serverProject, "server") + " "
                     + firstNonBlank(state.serverGameVersion, "unlocked")
@@ -9594,6 +9867,10 @@ public final class AutoUpdater {
         }
 
         private void updateLockIfNeeded(TargetConfig target, ResolvedDownload download) {
+            updateLockIfNeeded(target, download, false);
+        }
+
+        private void updateLockIfNeeded(TargetConfig target, ResolvedDownload download, boolean preservePreparedDiscovery) {
             if (!target.server || !"papermc".equals(download.sourceType) || download.gameVersion == null || download.gameVersion.isBlank()) {
                 pathDebug(target, "lock.server.update.skip", "target.server=" + target.server
                     + "; sourceType=" + firstNonBlank(download.sourceType, "unknown")
@@ -9611,15 +9888,23 @@ public final class AutoUpdater {
                 if (serverChanged) {
                     clearedPluginFailures = state.badPluginVersions.size();
                     clearedSourceFailures = state.badSourceBuilds.size();
-                    clearedDiscoveryStates = state.discoveryStates.size();
+                    clearedDiscoveryStates = preservePreparedDiscovery ? 0 : state.discoveryStates.size();
                     state.badPluginVersions.clear();
                     state.badSourceBuilds.clear();
-                    state.discoveryStates.clear();
+                    if (!preservePreparedDiscovery) { state.discoveryStates.clear(); }
                 }
                 state.serverProject = download.project;
                 state.serverGameVersion = download.gameVersion;
                 state.serverBuild = download.build;
                 state.write(config);
+                lockState.serverProject = state.serverProject;
+                lockState.serverGameVersion = state.serverGameVersion;
+                lockState.serverBuild = state.serverBuild;
+                if (serverChanged) {
+                    lockState.badPluginVersions.clear();
+                    lockState.badSourceBuilds.clear();
+                    if (!preservePreparedDiscovery) { lockState.discoveryStates.clear(); }
+                }
                 Log.info("Updated version lock -> " + lock.getFileName() + " (" + download.project + " " + download.gameVersion + ")");
                 pathDebug(target, "lock.server.update", "project=" + download.project
                     + "; gameVersion=" + download.gameVersion
@@ -10180,7 +10465,7 @@ public final class AutoUpdater {
             String commit = currentCommit(sourceDir);
             LockState lock = LockState.read(config);
             Optional<BadSourceBuild> badBuild = lock.activeBadSourceBuild(config, repoName, commit);
-            if (badBuild.isPresent()) {
+            if (badBuild.isPresent() && !config.preparingServerChange) {
                 throw new IOException("Skipping known-bad source build for " + repoName
                     + " at " + shortHash(commit) + " (" + firstNonBlank(badBuild.get().summary, badBuild.get().reason) + ")");
             }
@@ -13207,6 +13492,7 @@ public final class AutoUpdater {
     }
 
     private static final class ServerRunner {
+        private PreparedBatch nextBatch;
         private final AppConfig config;
         private final Updater updater;
 
@@ -13269,9 +13555,15 @@ public final class AutoUpdater {
                     return result.exitCode;
                 }
 
-                Log.info("Scheduled restart completed. Updating before next start.");
-                updater.pathDebug(null, "restart.update", "scheduled restart complete; running updateAll before next start");
-                pendingStartupUpdates = updater.updateAll();
+                Log.info("Scheduled shutdown completed. Installing prepared updates before next start.");
+                updater.pathDebug(null, "restart.update", "installing prepared/tested batch");
+                try {
+                    pendingStartupUpdates = updater.installPrepared(nextBatch);
+                } catch (Exception ex) {
+                    Log.warn("Update installation failed; restarting restored jars: " + safeExceptionMessage(ex));
+                    pendingStartupUpdates = Collections.emptyList();
+                }
+                nextBatch = null;
             }
         }
 
@@ -13357,7 +13649,9 @@ public final class AutoUpdater {
                     return;
                 }
                 try {
-                    updater.retryDeferredDiscoverySourcesAfterStartup();
+                    synchronized (updater) {
+                        updater.retryDeferredDiscoverySourcesAfterStartup();
+                    }
                 } catch (Exception ex) {
                     Log.warn("Deferred source discovery retry failed: " + safeExceptionMessage(ex));
                     updater.pathDebug(null, "startup.deferred-discovery.failed", safeExceptionMessage(ex));
@@ -13522,6 +13816,21 @@ public final class AutoUpdater {
                     }
                 }
                 if (!now.isBefore(restartAt)) {
+                    // Prepare while the current child is still online; failed tests never stop it.
+                    try {
+                        synchronized (updater) {
+                            nextBatch = updater.prepareUpdates();
+                        }
+                    } catch (Exception ex) {
+                        Log.warn("Scheduled update preparation failed; keeping server online: " + safeExceptionMessage(ex));
+                        nextBatch = null;
+                    }
+                    if (nextBatch == null || !nextBatch.approved) {
+                        restartAt = Instant.now().plus(config.restart.interval);
+                        sent.clear();
+                        Log.warn("Upgrade postponed; server stays online. Next check at " + restartAt + ".");
+                        continue;
+                    }
                     Log.info("Restart interval reached; stopping server.");
                     sendCommand(process, config.restart.stopCommand);
                     boolean stopped = process.waitFor(config.restart.gracefulStopSeconds, TimeUnit.SECONDS);
